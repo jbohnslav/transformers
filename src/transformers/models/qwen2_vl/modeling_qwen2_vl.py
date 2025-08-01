@@ -317,6 +317,20 @@ def eager_attention_forward(
 
     return attn_output, attn_weights
 
+@torch.compiler.disable(recursive=False)        # Torch-2 public API
+def _block_diag_mask(cu_seqlens: torch.Tensor) -> torch.Tensor | None:
+    """
+    Build (1, 1, S, S) bool mask that blocks attention across images.
+    Returns None if only one image (lengths.numel()==1).
+    """
+    lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+    if lengths.numel() <= 1:          # single image ⇒ no mask
+        return None
+    seq_ids = torch.repeat_interleave(
+        torch.arange(len(lengths), device=lengths.device), lengths
+    )
+    mask = seq_ids[:, None] != seq_ids[None, :]
+    return mask[None, None]           # (1,1,S,S)
 
 class VisionAttention(nn.Module):
     def __init__(self, config: Qwen2VLVisionConfig) -> None:
@@ -385,20 +399,11 @@ class VisionAttention(nn.Module):
                 **kwargs,
             )
         else:
-            # Other implementations: Process each chunk separately
-            # Create a block-diagonal attention mask from un-even lengths
-            # without a graph-breaking for-loop.
-            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-            if lengths.size(0) > 1:
-                # Create a sequence ID for each token, e.g., [0,0,0,1,1,2,2,2,...]
-                sequence_ids = torch.repeat_interleave(
-                    torch.arange(lengths.size(0), device=lengths.device), lengths
-                )
-                # Attention mask is True where tokens are in the same sequence, False otherwise
-                attention_mask = sequence_ids[:, None] != sequence_ids[None, :]
-                attention_mask = attention_mask[None, None, :, :]
-            else:
-                attention_mask = None # A single sequence doesn't need a mask
+            # Build a fresh block-diagonal mask **only** while tracing in eager mode.
+            # When the graph is later executed by torch.compile, the mask is provided
+            # as a runtime input, so we skip rebuilding it to avoid baking a constant
+            # mask into the graph.
+            attention_mask = _block_diag_mask(cu_seqlens)
 
             # Single batched call (batch dim = 1) with block-diagonal mask.
             attn_output, _ = attention_interface(
@@ -1021,64 +1026,61 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
                 3, input_ids.shape[0], input_ids.shape[1], dtype=input_ids.dtype, device=input_ids.device
             )
             image_index, video_index = 0, 0
-            for i, input_ids in enumerate(total_input_ids):
-                input_ids = input_ids[attention_mask[i].to(input_ids.device) == 1]
-                image_nums, video_nums = 0, 0
-                vision_start_indices = torch.argwhere(input_ids == vision_start_token_id).squeeze(1)
-                vision_tokens = input_ids[vision_start_indices + 1]
+            for i, current_input_ids in enumerate(total_input_ids):
+                current_input_ids = current_input_ids[attention_mask[i].to(current_input_ids.device) == 1]
+                vision_start_indices = torch.argwhere(current_input_ids == vision_start_token_id).squeeze(1)
+                vision_tokens = current_input_ids[vision_start_indices + 1]
                 image_nums = (vision_tokens == image_token_id).sum()
                 video_nums = (vision_tokens == video_token_id).sum()
-                input_tokens = [int(tok) for tok in input_ids.to("cpu", non_blocking=True)]
+
+                # Find locations of all image/video tokens
+                image_locs = torch.argwhere(current_input_ids == image_token_id)
+                video_locs = torch.argwhere(current_input_ids == video_token_id)
+                
+                # Combine and sort them to process in order
+                vision_locs = torch.cat([image_locs, video_locs])
+                is_image = torch.cat([torch.ones_like(image_locs), torch.zeros_like(video_locs)]).bool()
+                
+                sorted_indices = vision_locs.squeeze(1).argsort()
+                vision_locs = vision_locs[sorted_indices]
+                is_image = is_image[sorted_indices]
+                
                 llm_pos_ids_list: list = []
                 st = 0
-                remain_images, remain_videos = image_nums, video_nums
-                for _ in range(image_nums + video_nums):
-                    if image_token_id in input_tokens and remain_images > 0:
-                        ed_image = input_tokens.index(image_token_id, st)
+                
+                current_image_idx = 0
+                current_video_idx = 0
+
+                for j in range(len(vision_locs)):
+                    ed = vision_locs[j]
+                    if is_image[j]:
+                        t, h, w = image_grid_thw[image_index + current_image_idx]
+                        current_image_idx += 1
                     else:
-                        ed_image = len(input_tokens) + 1
-                    if video_token_id in input_tokens and remain_videos > 0:
-                        ed_video = input_tokens.index(video_token_id, st)
-                    else:
-                        ed_video = len(input_tokens) + 1
-                    if ed_image < ed_video:
-                        t, h, w = (
-                            image_grid_thw[image_index][0],
-                            image_grid_thw[image_index][1],
-                            image_grid_thw[image_index][2],
-                        )
-                        image_index += 1
-                        remain_images -= 1
-                        ed = ed_image
-                    else:
-                        t, h, w = (
-                            video_grid_thw[video_index][0],
-                            video_grid_thw[video_index][1],
-                            video_grid_thw[video_index][2],
-                        )
-                        video_index += 1
-                        remain_videos -= 1
-                        ed = ed_video
-                    llm_grid_t, llm_grid_h, llm_grid_w = (
-                        t.item(),
-                        h.item() // spatial_merge_size,
-                        w.item() // spatial_merge_size,
-                    )
+                        t, h, w = video_grid_thw[video_index + current_video_idx]
+                        current_video_idx += 1
+
+                    llm_grid_t = t
+                    llm_grid_h = h // spatial_merge_size
+                    llm_grid_w = w // spatial_merge_size
                     text_len = ed - st
 
                     st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
-                    llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+                    llm_pos_ids_list.append(torch.arange(text_len, device=input_ids.device).view(1, -1).expand(3, -1) + st_idx)
 
-                    t_index = torch.arange(llm_grid_t).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten()
-                    h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(llm_grid_t, -1, llm_grid_w).flatten()
-                    w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(llm_grid_t, llm_grid_h, -1).flatten()
+                    t_index = torch.arange(llm_grid_t, device=input_ids.device).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten()
+                    h_index = torch.arange(llm_grid_h, device=input_ids.device).view(1, -1, 1).expand(llm_grid_t, -1, llm_grid_w).flatten()
+                    w_index = torch.arange(llm_grid_w, device=input_ids.device).view(1, 1, -1).expand(llm_grid_t, llm_grid_h, -1).flatten()
                     llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index]) + text_len + st_idx)
                     st = ed + llm_grid_t * llm_grid_h * llm_grid_w
+                
+                image_index += image_nums
+                video_index += video_nums
 
-                if st < len(input_tokens):
+                if st < len(current_input_ids):
                     st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
-                    text_len = len(input_tokens) - st
-                    llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+                    text_len = len(current_input_ids) - st
+                    llm_pos_ids_list.append(torch.arange(text_len, device=input_ids.device).view(1, -1).expand(3, -1) + st_idx)
 
                 llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
                 position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(position_ids.device)
@@ -1120,10 +1122,6 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         """
         pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
         video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
-        video_grid_thw_cpu = video_grid_thw.to("cpu", non_blocking=True)
-        split_sizes = (video_grid_thw_cpu.prod(-1) // self.visual.spatial_merge_size**2)
-        boundaries = torch.cumsum(split_sizes, 0)[:-1]
-        video_embeds = torch.tensor_split(video_embeds, boundaries)
         return video_embeds
 
     def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: Optional[torch.LongTensor] = None):
@@ -1138,10 +1136,6 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         """
         pixel_values = pixel_values.type(self.visual.dtype)
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-        image_grid_thw = image_grid_thw.to("cpu", non_blocking=True)
-        split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2)
-        boundaries = torch.cumsum(split_sizes, 0)[:-1]   
-        image_embeds = torch.tensor_split(image_embeds, boundaries)
         return image_embeds
 
     def get_placeholder_mask(
@@ -1224,7 +1218,7 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
 
         if pixel_values is not None:
             image_embeds = self.get_image_features(pixel_values, image_grid_thw)
-            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
             )
@@ -1232,7 +1226,7 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
 
         if pixel_values_videos is not None:
             video_embeds = self.get_video_features(pixel_values_videos, video_grid_thw)
-            video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             _, video_mask = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
             )
