@@ -201,14 +201,15 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim
 def apply_rotary_pos_emb_vision(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    orig_q_dtype = q.dtype
-    orig_k_dtype = k.dtype
-    q, k = q.float(), k.float()
-    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    q_embed = q_embed.to(orig_q_dtype)
-    k_embed = k_embed.to(orig_k_dtype)
+    orig_dtype = q.dtype
+    q = q.to(torch.float32, copy=False)
+    k = k.to(torch.float32, copy=False)
+    cos = cos.unsqueeze(-2).to(torch.float32, copy=False)
+    sin = sin.unsqueeze(-2).to(torch.float32, copy=False)
+    q_embed = q * cos + rotate_half(q) * sin
+    k_embed = k * cos + rotate_half(k) * sin
+    q_embed = q_embed.to(orig_dtype, copy=False)
+    k_embed = k_embed.to(orig_dtype, copy=False)
     return q_embed, k_embed
 
 
