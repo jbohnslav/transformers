@@ -386,25 +386,32 @@ class VisionAttention(nn.Module):
             )
         else:
             # Other implementations: Process each chunk separately
-            lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to("cpu", non_blocking=True)
-            size_list = [int(l) for l in lengths]
-            splits = [torch.split(tensor, size_list, dim=2) for tensor in (query_states, key_states, value_states)]
+            # Create a block-diagonal attention mask from un-even lengths
+            # without a graph-breaking for-loop.
+            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            if lengths.size(0) > 1:
+                # Create a sequence ID for each token, e.g., [0,0,0,1,1,2,2,2,...]
+                sequence_ids = torch.repeat_interleave(
+                    torch.arange(lengths.size(0), device=lengths.device), lengths
+                )
+                # Attention mask is True where tokens are in the same sequence, False otherwise
+                attention_mask = sequence_ids[:, None] != sequence_ids[None, :]
+                attention_mask = attention_mask[None, None, :, :]
+            else:
+                attention_mask = None # A single sequence doesn't need a mask
 
-            attn_outputs = [
-                attention_interface(
-                    self,
-                    q,
-                    k,
-                    v,
-                    attention_mask=None,
-                    scaling=self.scaling,
-                    dropout=0.0 if not self.training else self.attention_dropout,
-                    is_causal=False,
-                    **kwargs,
-                )[0]
-                for q, k, v in zip(*splits)
-            ]
-            attn_output = torch.cat(attn_outputs, dim=1)
+            # Single batched call (batch dim = 1) with block-diagonal mask.
+            attn_output, _ = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask=attention_mask,
+                scaling=self.scaling,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                is_causal=False,
+                **kwargs,
+            )
 
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
         attn_output = self.proj(attn_output)
