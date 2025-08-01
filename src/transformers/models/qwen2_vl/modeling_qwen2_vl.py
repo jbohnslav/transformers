@@ -386,10 +386,9 @@ class VisionAttention(nn.Module):
             )
         else:
             # Other implementations: Process each chunk separately
-            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-            splits = [
-                torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
-            ]
+            lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to("cpu", non_blocking=True)
+            size_list = [int(l) for l in lengths]
+            splits = [torch.split(tensor, size_list, dim=2) for tensor in (query_states, key_states, value_states)]
 
             attn_outputs = [
                 attention_interface(
@@ -1022,7 +1021,7 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
                 vision_tokens = input_ids[vision_start_indices + 1]
                 image_nums = (vision_tokens == image_token_id).sum()
                 video_nums = (vision_tokens == video_token_id).sum()
-                input_tokens = input_ids.tolist()
+                input_tokens = [int(tok) for tok in input_ids.to("cpu", non_blocking=True)]
                 llm_pos_ids_list: list = []
                 st = 0
                 remain_images, remain_videos = image_nums, video_nums
@@ -1114,8 +1113,10 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         """
         pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
         video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
-        split_sizes = (video_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
-        video_embeds = torch.split(video_embeds, split_sizes)
+        video_grid_thw_cpu = video_grid_thw.to("cpu", non_blocking=True)
+        split_sizes = (video_grid_thw_cpu.prod(-1) // self.visual.spatial_merge_size**2)
+        boundaries = torch.cumsum(split_sizes, 0)[:-1]
+        video_embeds = torch.tensor_split(video_embeds, boundaries)
         return video_embeds
 
     def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: Optional[torch.LongTensor] = None):
@@ -1130,8 +1131,10 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         """
         pixel_values = pixel_values.type(self.visual.dtype)
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-        split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
-        image_embeds = torch.split(image_embeds, split_sizes)
+        image_grid_thw = image_grid_thw.to("cpu", non_blocking=True)
+        split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2)
+        boundaries = torch.cumsum(split_sizes, 0)[:-1]   
+        image_embeds = torch.tensor_split(image_embeds, boundaries)
         return image_embeds
 
     def get_placeholder_mask(
@@ -1599,9 +1602,14 @@ class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
                         dict_to_expand[key], lengths=lengths, repeat_times=expand_size
                     )
                 elif key == "second_per_grid_ts":
-                    dict_to_expand[key] = _repeat_interleave_samples(
-                        dict_to_expand[key], lengths=list(video_nums), repeat_times=expand_size
-                    )
+                    if not isinstance(dict_to_expand[key], list):
+                        raise TypeError(
+                            f"Expected value for key '{key}' to be a list, but got {type(dict_to_expand[key])} instead."
+                        )
+                    tensor = torch.tensor(dict_to_expand[key])
+                    lengths = list(video_nums)
+                    tensor = _repeat_interleave_samples(tensor, lengths=lengths, repeat_times=expand_size)
+                    dict_to_expand[key] = [int(x) for x in tensor.to("cpu", non_blocking=True)]
             return dict_to_expand
 
         def _expand_dict_for_generation(dict_to_expand):
