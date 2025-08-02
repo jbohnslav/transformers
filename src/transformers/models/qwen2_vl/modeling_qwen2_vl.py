@@ -1127,8 +1127,8 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
         video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
         split_sizes = (video_grid_thw.prod(-1) // self.visual.spatial_merge_size**2)
-        split_sizes = [int(x) for x in split_sizes.to("cpu", non_blocking=True)]
-        video_embeds = torch.split(video_embeds, split_sizes)
+        split_indices = torch.cumsum(split_sizes, dim=0)[:-1]
+        video_embeds = torch.tensor_split(video_embeds, split_indices.to("cpu", non_blocking=True), dim=0)
         return video_embeds
 
     def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: Optional[torch.LongTensor] = None):
@@ -1144,8 +1144,8 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         pixel_values = pixel_values.type(self.visual.dtype)
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
         split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2)
-        split_sizes = [int(x) for x in split_sizes.to("cpu", non_blocking=True)]
-        image_embeds = torch.split(image_embeds, split_sizes)
+        split_indices = torch.cumsum(split_sizes, dim=0)[:-1]
+        image_embeds = torch.tensor_split(image_embeds, split_indices.to("cpu", non_blocking=True), dim=0)
         return image_embeds
 
     def get_placeholder_mask(
